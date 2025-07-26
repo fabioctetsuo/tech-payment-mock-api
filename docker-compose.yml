@@ -1,0 +1,16 @@
+services:
+  # Payment API
+  payment-api:
+    container_name: pagamento-mock
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - '4000:4000'
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - PAYMENT_WEBHOOK_URL=http://host.docker.internal:3002/webhooks
+    restart: unless-stopped
