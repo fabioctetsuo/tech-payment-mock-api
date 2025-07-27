@@ -63,3 +63,5 @@ pagamento-mock/.env
 
 # metrics
 grafana
+
+secrets.txt

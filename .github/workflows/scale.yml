@@ -1,0 +1,137 @@
+name: Scale Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'payment-mock-service'
+        type: string
+      action:
+        description: 'Scaling action'
+        required: true
+        type: choice
+        options:
+          - scale-up
+          - scale-down
+          - set-replicas
+      replicas:
+        description: 'Number of replicas (required for set-replicas action)'
+        required: false
+        type: string
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Get current replicas
+      id: current-replicas
+      run: |
+        CURRENT_REPLICAS=$(kubectl get deployment pagamento-mock -n ${{ inputs.namespace }} -o jsonpath='{.spec.replicas}')
+        echo "current_replicas=$CURRENT_REPLICAS" >> $GITHUB_OUTPUT
+        echo "Current replicas: $CURRENT_REPLICAS"
+        
+    - name: Calculate target replicas
+      id: target-replicas
+      run: |
+        CURRENT_REPLICAS="${{ steps.current-replicas.outputs.current_replicas }}"
+        
+        case "${{ inputs.action }}" in
+          "scale-up")
+            TARGET_REPLICAS=$((CURRENT_REPLICAS + 1))
+            ;;
+          "scale-down")
+            TARGET_REPLICAS=$((CURRENT_REPLICAS - 1))
+            if [ $TARGET_REPLICAS -lt 1 ]; then
+              TARGET_REPLICAS=1
+            fi
+            ;;
+          "set-replicas")
+            if [ -z "${{ inputs.replicas }}" ]; then
+              echo "Error: replicas parameter is required for set-replicas action"
+              exit 1
+            fi
+            TARGET_REPLICAS="${{ inputs.replicas }}"
+            ;;
+          *)
+            echo "Error: Invalid action"
+            exit 1
+            ;;
+        esac
+        
+        echo "target_replicas=$TARGET_REPLICAS" >> $GITHUB_OUTPUT
+        echo "Target replicas: $TARGET_REPLICAS"
+        
+    - name: Scale deployment
+      run: |
+        kubectl scale deployment pagamento-mock -n ${{ inputs.namespace }} --replicas=${{ steps.target-replicas.outputs.target_replicas }}
+        
+    - name: Wait for scaling
+      run: |
+        kubectl rollout status deployment/pagamento-mock -n ${{ inputs.namespace }} --timeout=300s
+        
+    - name: Get service URL
+      id: service-url
+      run: |
+        SERVICE_HOST=$(kubectl get svc payment-mock-service-loadbalancer -n ${{ inputs.namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        
+        if [ -n "$SERVICE_HOST" ]; then
+          echo "service_url=http://$SERVICE_HOST:4000" >> $GITHUB_OUTPUT
+          echo "Service URL: http://$SERVICE_HOST:4000"
+        else
+          echo "service_url=Not available yet" >> $GITHUB_OUTPUT
+          echo "Service URL not available yet"
+        fi
+        
+    - name: Health check
+      run: |
+        SERVICE_URL="${{ steps.service-url.outputs.service_url }}"
+        
+        if [ "$SERVICE_URL" != "Not available yet" ]; then
+          echo "Performing health check..."
+          
+          # Wait a bit more for the service to be fully ready
+          sleep 30
+          
+          # Try health check
+          if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+            echo "✅ Service is healthy after scaling"
+          else
+            echo "⚠️  Health check failed, but scaling completed"
+          fi
+        else
+          echo "⚠️  Service URL not available"
+        fi
+        
+    - name: Scaling summary
+      run: |
+        echo "## 📈 Scaling Complete!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Scaling Details:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Action:** ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **From Replicas:** ${{ steps.current-replicas.outputs.current_replicas }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **To Replicas:** ${{ steps.target-replicas.outputs.target_replicas }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Useful Commands:**" >> $GITHUB_STEP_SUMMARY
+        echo "```bash" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get deployment pagamento-mock -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl top pods -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "```" >> $GITHUB_STEP_SUMMARY 

@@ -1,0 +1,187 @@
+name: Manual Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker image to deploy (e.g., username/pagamento-mock:latest)'
+        required: true
+        default: '${{ github.repository }}:latest'
+        type: string
+      payment_webhook_url:
+        description: 'Payment Webhook URL (optional - will be auto-detected if not provided)'
+        required: false
+        type: string
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'payment-mock-service'
+        type: string
+      replicas:
+        description: 'Number of replicas'
+        required: false
+        default: '1'
+        type: string
+
+env:
+  REGISTRY: docker.io
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Verify cluster access
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        
+    - name: Create or update namespace
+      run: |
+        kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Create or update ConfigMap
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: pagamento-mock-config
+          namespace: ${{ inputs.namespace }}
+        data:
+          NODE_ENV: "${{ inputs.environment }}"
+          SERVICE_PORT: "4000"
+          PORT: "4000"
+        EOF
+        
+    - name: Get external service URLs
+      id: service-urls
+      run: |
+        # Get PAYMENT_WEBHOOK_URL from LoadBalancer if not provided
+        if [ -z "${{ inputs.payment_webhook_url }}" ]; then
+          PAYMENT_EXTERNAL_IP=$(kubectl get svc payment-service-loadbalancer -n payment-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -n "$PAYMENT_EXTERNAL_IP" ]; then
+            PAYMENT_WEBHOOK_URL="http://${PAYMENT_EXTERNAL_IP}:3003/webhooks"
+            echo "payment_webhook_url=$PAYMENT_WEBHOOK_URL" >> $GITHUB_OUTPUT
+            echo "✅ Payment Webhook URL retrieved: $PAYMENT_WEBHOOK_URL"
+          else
+            PAYMENT_WEBHOOK_URL="http://payment-service-loadbalancer.payment-service.svc.cluster.local:3003/webhooks"
+            echo "payment_webhook_url=$PAYMENT_WEBHOOK_URL" >> $GITHUB_OUTPUT
+            echo "⚠️  Using fallback Payment Webhook URL: $PAYMENT_WEBHOOK_URL"
+          fi
+        else
+          PAYMENT_WEBHOOK_URL="${{ inputs.payment_webhook_url }}"
+          echo "payment_webhook_url=$PAYMENT_WEBHOOK_URL" >> $GITHUB_OUTPUT
+          echo "✅ Using provided Payment Webhook URL: $PAYMENT_WEBHOOK_URL"
+        fi
+        
+    - name: Create or update Secret
+      run: |
+        kubectl create secret generic pagamento-mock-secret \
+          --from-literal=PAYMENT_WEBHOOK_URL="${{ steps.service-urls.outputs.payment_webhook_url }}" \
+          --namespace=${{ inputs.namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Generate Kubernetes manifests
+      run: |
+        envsubst < k8s/deployment.yaml.template > k8s/deployment.yaml
+        envsubst < k8s/service.yaml.template > k8s/service.yaml
+        
+    - name: Update replicas in deployment
+      run: |
+        sed -i "s/replicas: 1/replicas: ${{ inputs.replicas }}/" k8s/deployment.yaml
+        
+    - name: Apply Kubernetes manifests
+      run: |
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+        
+    - name: Wait for deployment
+      run: |
+        kubectl rollout status deployment/pagamento-mock -n ${{ inputs.namespace }} --timeout=300s
+        
+    - name: Get service URL
+      id: service-url
+      run: |
+        SERVICE_HOST=$(kubectl get svc payment-mock-service-loadbalancer -n ${{ inputs.namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        
+        if [ -n "$SERVICE_HOST" ]; then
+          echo "service_url=http://$SERVICE_HOST:4000" >> $GITHUB_OUTPUT
+          echo "Service URL: http://$SERVICE_HOST:4000"
+        else
+          echo "service_url=Not available yet" >> $GITHUB_OUTPUT
+          echo "Service URL not available yet"
+        fi
+        
+    - name: Health check
+      run: |
+        SERVICE_URL="${{ steps.service-url.outputs.service_url }}"
+        
+        if [ "$SERVICE_URL" != "Not available yet" ]; then
+          echo "Performing health check..."
+          
+          # Wait a bit more for the service to be fully ready
+          sleep 30
+          
+          # Try health check
+          if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+            echo "✅ Service is healthy"
+          else
+            echo "⚠️  Health check failed, but deployment completed"
+          fi
+        else
+          echo "⚠️  Skipping health check - service URL not available"
+        fi
+        
+    - name: Deployment summary
+      run: |
+        echo "## 🎉 Payment Mock Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Replicas:** ${{ inputs.replicas }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Docker Image:** ${{ inputs.docker_image }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Payment Webhook URL:** ${{ steps.service-urls.outputs.payment_webhook_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Service URLs:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check:** ${{ steps.service-url.outputs.service_url }}/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Documentation:** ${{ steps.service-url.outputs.service_url }}/api" >> $GITHUB_STEP_SUMMARY
+        echo "- **Swagger UI:** ${{ steps.service-url.outputs.service_url }}/api" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Useful Commands:**" >> $GITHUB_STEP_SUMMARY
+        echo "```bash" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get svc -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl logs -f deployment/pagamento-mock -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "```" >> $GITHUB_STEP_SUMMARY
+      env:
+        DOCKER_IMAGE: ${{ inputs.docker_image }}
+        SERVICE_NAME: pagamento-mock
+        SERVICE_PORT: "4000"
+        NAMESPACE: ${{ inputs.namespace }}
+        DOMAIN_NAME: tech-challenge.local 

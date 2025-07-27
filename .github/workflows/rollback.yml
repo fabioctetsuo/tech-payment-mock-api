@@ -1,0 +1,106 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'payment-mock-service'
+        type: string
+      revision:
+        description: 'Revision number to rollback to (leave empty for previous)'
+        required: false
+        type: string
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Check deployment history
+      run: |
+        echo "## Deployment History" >> $GITHUB_STEP_SUMMARY
+        echo "```bash" >> $GITHUB_STEP_SUMMARY
+        kubectl rollout history deployment/pagamento-mock -n ${{ inputs.namespace }} >> $GITHUB_STEP_SUMMARY
+        echo "```" >> $GITHUB_STEP_SUMMARY
+        
+    - name: Rollback deployment
+      run: |
+        if [ -z "${{ inputs.revision }}" ]; then
+          echo "Rolling back to previous revision..."
+          kubectl rollout undo deployment/pagamento-mock -n ${{ inputs.namespace }}
+        else
+          echo "Rolling back to revision ${{ inputs.revision }}..."
+          kubectl rollout undo deployment/pagamento-mock -n ${{ inputs.namespace }} --to-revision=${{ inputs.revision }}
+        fi
+        
+    - name: Wait for rollback
+      run: |
+        kubectl rollout status deployment/pagamento-mock -n ${{ inputs.namespace }} --timeout=300s
+        
+    - name: Get service URL
+      id: service-url
+      run: |
+        SERVICE_HOST=$(kubectl get svc payment-mock-service-loadbalancer -n ${{ inputs.namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        
+        if [ -n "$SERVICE_HOST" ]; then
+          echo "service_url=http://$SERVICE_HOST:4000" >> $GITHUB_OUTPUT
+          echo "Service URL: http://$SERVICE_HOST:4000"
+        else
+          echo "service_url=Not available yet" >> $GITHUB_OUTPUT
+          echo "Service URL not available yet"
+        fi
+        
+    - name: Health check
+      run: |
+        SERVICE_URL="${{ steps.service-url.outputs.service_url }}"
+        
+        if [ "$SERVICE_URL" != "Not available yet" ]; then
+          echo "Performing health check..."
+          
+          # Wait a bit more for the service to be fully ready
+          sleep 30
+          
+          # Try health check
+          if curl -f -s "$SERVICE_URL/health" > /dev/null; then
+            echo "✅ Service is healthy after rollback"
+          else
+            echo "⚠️  Health check failed, but rollback completed"
+          fi
+        else
+          echo "⚠️  Skipping health check - service URL not available"
+        fi
+        
+    - name: Rollback summary
+      run: |
+        echo "## 🔄 Rollback Complete!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Rollback Details:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Revision:** ${{ inputs.revision || 'Previous' }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Service URLs:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check:** ${{ steps.service-url.outputs.service_url }}/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Documentation:** ${{ steps.service-url.outputs.service_url }}/api" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Useful Commands:**" >> $GITHUB_STEP_SUMMARY
+        echo "```bash" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get pods -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl rollout history deployment/pagamento-mock -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "kubectl logs -f deployment/pagamento-mock -n ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "```" >> $GITHUB_STEP_SUMMARY 

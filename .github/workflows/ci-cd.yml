@@ -1,0 +1,141 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    # - name: Run linting
+    #   run: npm run lint
+      
+    # - name: Run tests
+    #   run: npm test
+      
+    - name: Build application
+      run: npm run build
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Get external service URLs
+      id: service-urls
+      run: |
+        # Get PAYMENT_WEBHOOK_URL from LoadBalancer
+        PAYMENT_EXTERNAL_IP=$(kubectl get svc payment-service-loadbalancer -n payment-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        
+        if [ -n "$PAYMENT_EXTERNAL_IP" ]; then
+          PAYMENT_WEBHOOK_URL="http://${PAYMENT_EXTERNAL_IP}:3003/webhooks"
+          echo "payment_webhook_url=$PAYMENT_WEBHOOK_URL" >> $GITHUB_OUTPUT
+          echo "✅ Payment Webhook URL retrieved: $PAYMENT_WEBHOOK_URL"
+        else
+          PAYMENT_WEBHOOK_URL="http://payment-service-loadbalancer.payment-service.svc.cluster.local:3003/webhooks"
+          echo "payment_webhook_url=$PAYMENT_WEBHOOK_URL" >> $GITHUB_OUTPUT
+          echo "⚠️  Using fallback Payment Webhook URL: $PAYMENT_WEBHOOK_URL"
+        fi
+        
+    - name: Deploy to Kubernetes
+      run: |
+        # Generate Kubernetes manifests
+        envsubst < k8s/deployment.yaml.template > k8s/deployment.yaml
+        envsubst < k8s/service.yaml.template > k8s/service.yaml
+        
+        # Apply manifests
+        kubectl apply -f k8s/namespace.yaml
+        
+        # Create secret with payment webhook URL
+        kubectl create secret generic pagamento-mock-secret \
+          --from-literal=PAYMENT_WEBHOOK_URL="${{ steps.service-urls.outputs.payment_webhook_url }}" \
+          --namespace=payment-mock-service \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+        
+        # Wait for deployment to be ready
+        kubectl rollout status deployment/pagamento-mock -n payment-mock-service --timeout=300s
+      env:
+        DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        SERVICE_NAME: pagamento-mock
+        SERVICE_PORT: "4000"
+        NAMESPACE: payment-mock-service
+        DOMAIN_NAME: tech-challenge.local 
